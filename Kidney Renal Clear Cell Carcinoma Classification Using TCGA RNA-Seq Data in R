@@ -1,0 +1,1488 @@
+
+---
+title: "Kidney Renal Clear Cell Carcinoma Classification Using TCGA RNA-Seq Data"
+author: "Ya-Ting Yang"
+date: "2025-03-10"
+output: html_document
+---
+
+#### The dataset for this assignment is The Cancer Genome Atlas Kidney Renal Clear Cell Carcinoma (TCGA-KIRC). It is a specific type of kidney cancer that originates from the clear cells in the renal tubules. It accounts for approximately 75-80% of all kidney cancer cases.<br><br>
+
+
+```{r setup, include=FALSE, fig.show = 'hold'}
+# record start time
+start_time <- Sys.time()
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+setwd("C:/Week 9 Final Project")
+library(TCGAbiolinks)
+library(EDASeq) # required for sample normalization
+library(dplyr) 
+library(pheatmap)
+library(Biobase)
+library(tidymodels)
+library(tidyr) 
+library(kernlab)
+library(vip)
+library(ggplot2) 
+library(DALEXtra)
+library(modeldata)
+library(forcats)
+library(doParallel)
+library(foreach)
+library(rsample)
+library(yardstick)
+library(broom)
+library(caret)
+library(e1071)  # SVM
+library(randomForest)  # Random Forest
+library(Hmisc)
+options(warn = -1)
+```
+
+```{r}
+# library(TCGAbiolinks)
+# library(EDASeq) # required for sample normalization
+# browseVignettes("TCGAbiolinks")
+
+# Get the summary information of the TCGA-KIRC project.
+TCGAbiolinks:::getProjectSummary("TCGA-KIRC")
+
+##### Downloading and prepare TARGET CASE #####
+TargetSamples <- GDCquery(project = "TCGA-KIRC", 
+                         data.category = "Transcriptome Profiling", 
+                         data.type = "Gene Expression Quantification",
+                         workflow.type = "STAR - Counts")
+
+##### obtain case information #####
+CaseInfo <- getResults(TargetSamples)#, cols = c("cases"))
+# head(CaseInfo)
+
+##### subset samples so that there is an equal number of cancer and control samples #####
+dataPrimary_Target <- TCGAquery_SampleTypes(barcode = CaseInfo$cases, typesample = "TP") # primary tumor
+dataNormal_Target <- TCGAquery_SampleTypes(barcode = CaseInfo$cases, typesample = "NT") # normal tissue
+
+# Limit the number of samples to ensure an equal quantity of tumor and normal samples.
+dataPrimary_Target <- dataPrimary_Target[1:50]
+dataNormal_Target <- dataNormal_Target[1:50]
+
+##### downloaded samples of interest #####
+TargetSamples <- GDCquery(project = "TCGA-KIRC",
+                             data.category = "Transcriptome Profiling",
+                             data.type = "Gene Expression Quantification",
+                             workflow.type = "STAR - Counts",
+                             barcode = c(dataPrimary_Target, dataNormal_Target))
+##### Download the data (Note: Depending on your computer, you may not have enough RAM to process this amount of data. If this happens, please subset the data to include 50 cancer and 50 normal tissue samples)
+
+# Download the data
+GDCdownload(TargetSamples) # will download 100 files.
+
+# Prepare the data
+data <- GDCprepare(TargetSamples)
+
+assays(data)
+# colData(data)
+rowData(data)
+
+table(rowData(data)$gene_type)
+
+# Get the data for protein_coding genes
+SECoding <- data[rowData(data)$gene_type == "protein_coding", ]
+##### The following function will return the data from specified slots in the summarizedExperiment object #####
+
+# Preprocess the data
+dataPrep_Coding <- TCGAanalyze_Preprocessing(object = SECoding, cor.cut = 0.6,  datatype = "fpkm_unstrand")
+
+# Plot the boxplot
+boxplot(dataPrep_Coding, outline = FALSE)
+
+# Normalize the data
+dataNorm_Coding <- TCGAanalyze_Normalization(tabDF = dataPrep_Coding, geneInfo = geneInfoHT, method = "geneLength")
+
+# Filter the data
+dataFilt_Coding <- TCGAanalyze_Filtering(tabDF = dataPrep_Coding, method = "quantile", qnt.cut =  0.25)
+```
+
+```{r}
+library(qs)
+
+# Save dataNorm_Coding
+qsave(dataNorm_Coding, "dataNorm_Coding.qs")
+
+# Save dataFilt_Coding
+qsave(dataFilt_Coding, "dataFilt_Coding.qs")
+
+# Load dataNorm_Coding
+dataNorm_Coding <- qread("dataNorm_Coding.qs")
+
+# Load dataFilt_Coding 
+dataFilt_Coding <- qread("dataFilt_Coding.qs")
+```
+
+```{r}
+boxplot(dataNorm_Coding, outline = FALSE)
+
+# Subset samples so that there is an equal number of cancer and control samples 
+dataNormal_Target <- colnames(dataNorm_Coding)[1:50]
+dataPrimary_Target <- colnames(dataNorm_Coding)[51:100]
+
+# Differential expression analysis
+DEGsCoding <- TCGAanalyze_DEA(mat1 = dataFilt_Coding[,dataNormal_Target],
+                              mat2 = dataFilt_Coding[,dataPrimary_Target],
+                              pipeline="limma",
+                              Cond1type = "Normal",
+                              Cond2type = "Tumor",
+                              fdr.cut = 0.01 ,
+                              logFC.cut = 1,
+                              method = "glmLRT", ClinicalDF = data.frame())
+
+head(DEGsCoding)
+```
+
+
+# Problem 3.1.1
+#### Which genes are associated with continuous data attributes (e.g. days to death, age, ect…)? Do any of these genes represent confounding variables in the data set?
+
+
+```{r}
+# Extract colData 
+colData <- colData(data)
+
+# Convert colData to a data frame
+colData_df <- as.data.frame(colData)
+```
+
+```{r}
+# Assume DEGsCoding and dataNorm_Coding tables are already loaded into the R environment
+DEGs <- rownames(DEGsCoding)
+
+# Remove the part after the decimal point from gene names in DEGs
+DEGs_cleaned <- gsub("\\..*", "", DEGs)
+
+# Ensure that the gene names in DEGs_cleaned are unique
+DEGs_unique <- unique(DEGs_cleaned)
+
+# Extract data subset
+common_genes <- intersect(DEGs_unique, rownames(dataNorm_Coding))
+data_subset <- dataNorm_Coding[common_genes, ]
+# head(data_subset)
+
+# Rename the data_subset (top1000 DEGs)
+gene_expression_df <- data_subset
+```
+
+```{r}
+# Gene expression is the dependent variable (Y), to be predicted or explained. 
+# While age or death are the independent variables (X). 
+
+# Extract variables
+age_at_diagnosis <- colData_df$age_at_diagnosis
+
+# Extract row names and age_at_diagnosis column
+age_data <- data.frame(
+  sample = rownames(colData_df),  # Extract row names as sample names
+  age_at_diagnosis = colData_df$age_at_diagnosis  # Extract age_at_diagnosis column
+)
+
+# Convert gene expression data to long format
+gene_expression_long <- reshape2::melt(gene_expression_df)
+colnames(gene_expression_long) <- c("gene", "sample", "expression")
+
+# Merge age data with gene expression data
+age_combined <- merge(gene_expression_long, age_data, by = "sample")
+
+# Perform regression analysis
+results_age <- age_combined %>%
+  group_by(gene) %>%
+  summarise(p_value = summary(lm(expression ~ age_at_diagnosis))$coefficients[2, 4],
+            beta = summary(lm(expression ~ age_at_diagnosis))$coefficients[2, 1]) %>%
+  ungroup()
+
+# Filter genes with p-value less than 0.05
+significant_genes_age <- results_age[results_age$p_value < 0.05, ]
+
+# Sort by beta coefficient
+significant_genes_age <- significant_genes_age %>%
+  arrange(desc(beta))
+
+# Display significant genes
+head(significant_genes_age)
+
+```
+
+#### The above are significant genes related to age.<br><br>
+
+
+```{r}
+# Extract variables
+days_to_death <- colData_df$days_to_death
+
+# Extract row names and days_to_death column
+death_data <- data.frame(
+  sample = rownames(colData_df),  # Extract row names as sample names
+  days_to_death = colData_df$days_to_death  # Extract days_to_death column
+)
+
+# Convert gene expression data to long format
+gene_expression_long <- reshape2::melt(gene_expression_df)
+colnames(gene_expression_long) <- c("gene", "sample", "expression")
+
+# Merge death data with gene expression data
+death_combined <- merge(gene_expression_long, death_data, by = "sample")
+
+# Perform regression analysis
+results_death <- death_combined %>%
+  group_by(gene) %>%
+  summarise(p_value = summary(lm(expression ~ days_to_death))$coefficients[2, 4],
+            beta = summary(lm(expression ~ days_to_death))$coefficients[2, 1]) %>%
+  ungroup()
+
+# Filter genes with p-value less than 0.05
+significant_genes_death <- results_death[results_death$p_value < 0.05, ]
+
+# Sort by beta coefficient
+significant_genes_death <- significant_genes_death %>%
+  arrange(desc(beta))
+
+# Display significant genes
+head(significant_genes_death)
+
+```
+
+#### The above are significant genes related to days_to_death.<br><br>
+
+
+```{r}
+# Extract confounding variables
+gender_data <- colData_df$gender  
+
+# Merge gender data with gene expression data
+confounding_data <- data.frame(
+  sample = rownames(colData_df),
+  gender = gender_data
+)
+
+# Merge significant genes with confounding variables
+confounded_results <- significant_genes_age %>%
+  rowwise() %>%
+  do({
+    gene_name <- .$gene
+    gene_expression <- gene_expression_long[gene_expression_long$gene == gene_name, ]
+    
+    # Merge gene expression data with confounding variables
+    combined_data <- merge(gene_expression, confounding_data, by = "sample")
+    
+    # Perform multiple regression analysis
+    model <- lm(expression ~ age_at_diagnosis + gender, data = combined_data)
+    
+    # Extract regression results
+    summary_model <- summary(model)
+    p_value_age <- summary_model$coefficients["age_at_diagnosis", 4]
+    beta_age <- summary_model$coefficients["age_at_diagnosis", 1]
+    
+    data.frame(gene = gene_name, p_value_age = p_value_age, beta_age = beta_age)
+  })
+
+# Filter genes with p-value less than 0.05
+significant_confounded_genes <- confounded_results[confounded_results$p_value_age < 0.05, ]
+
+# Display significant confounded genes
+head(significant_confounded_genes)
+
+```
+
+#### Yes, there are 198 genes representing confounding variables in the data set.<br><br>
+
+
+# Problem 3.1.2
+#### Which genes correlate with other genes? to what extent and significance?
+
+```{r}
+# Transpose the data (top1000 DEGs)
+gene_expression_df <- t(data_subset)
+
+# Calculate correlation
+correlation_matrix <- cor(gene_expression_df, method = "pearson")
+
+# Convert the correlation matrix to a data frame
+correlation_df <- as.data.frame(as.table(correlation_matrix))
+
+# Add significance testing for correlation
+# library(Hmisc)
+cor_test_results <- rcorr(as.matrix(gene_expression_df))
+
+# Extract p-values
+p_values <- cor_test_results$P
+
+# Add p-values to the correlation data frame
+correlation_df$p_value <- as.vector(p_values)
+
+# Select significant correlations (e.g., absolute correlation greater than 0.5 and p-value less than 0.05)
+significant_correlations <- correlation_df[abs(correlation_df$Freq) > 0.7 & correlation_df$p_value < 0.05, ]
+
+# Remove NA values
+significant_correlations <- na.omit(significant_correlations)
+
+# Create a new variable to label paired combinations
+significant_correlations$pair <- apply(significant_correlations[, c("Var1", "Var2")], 1, function(x) {
+  paste(sort(x), collapse = "_")
+})
+
+# Remove redundant pairs, keeping only one direction
+unique_correlations <- significant_correlations[!duplicated(significant_correlations$pair), ]
+
+# Delete the auxiliary pair column
+unique_correlations$pair <- NULL
+
+# Display unique significant correlations
+head(unique_correlations)
+```
+
+#### After reducing the repeated pairs, a total of 523,515 significant gene correlations were found. The genes related to ENSG00000115109 include Var1 and these six others. The Freq column indicates the correlation coefficients between these genes. Positive values indicate positive correlations, while negative values indicate negative correlations. The p-value column (less than 0.05) indicates the significance level of these correlation coefficients.<br><br>
+
+
+# Problem 3.1.3
+#### Which meta data features correlate with each other?
+
+```{r}
+# Extract data
+race <- colData_df$race
+gender <- colData_df$gender
+ajcc_pathologic_stage <- colData_df$ajcc_pathologic_stage
+tumor_grade <- colData_df$tumor_grade
+vital_status <- colData_df$vital_status
+
+# Convert metadata features to a data frame
+meta_data_df <- data.frame(
+  age_at_diagnosis,
+  race = as.factor(race),
+  gender = as.factor(gender),
+  days_to_death,
+  ajcc_pathologic_stage = as.factor(ajcc_pathologic_stage),
+  tumor_grade = as.factor(tumor_grade),
+  vital_status = as.factor(vital_status)
+)
+
+# Convert categorical variables to numeric
+meta_data_df$race <- as.numeric(meta_data_df$race)
+meta_data_df$gender <- as.numeric(meta_data_df$gender)
+meta_data_df$ajcc_pathologic_stage <- as.numeric(meta_data_df$ajcc_pathologic_stage)
+meta_data_df$tumor_grade <- as.numeric(meta_data_df$tumor_grade)
+meta_data_df$vital_status <- as.numeric(meta_data_df$vital_status)
+
+# Calculate the Spearman correlation matrix
+meta_correlation_matrix <- cor(meta_data_df, method = "spearman")
+
+# Convert the correlation matrix to a data frame
+meta_correlation_df <- as.data.frame(as.table(meta_correlation_matrix))
+
+# Load the corrplot package
+library(corrplot)
+
+# Plot the correlation diagram
+corrplot(meta_correlation_matrix, method = "circle", type = "upper", tl.col = "black", tl.srt = 45)
+```
+
+
+#### The correlation matrix provides an overall overview of the relationships between the data variables. From the figure, we can see that except for race and gender, vital_statusgender has a slight correlation (0.2-0.4), while the others show no correlation.
+#### The correlation coefficient ranges from -1 to 1, where a coefficient of 1 indicates a perfect positive correlation, -1 indicates a perfect negative correlation, and 0 indicates no linear correlation<br><br>
+
+
+# Problem 3.2
+#### Which genes explain the greatest variance in the data? Which ones explain the least? Please explain why exploring the variance in the data is important for model building and how you would determine which genes to include in the model.
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(pheatmap)
+
+# Define the data_matrix as the normalized data
+data_matrix <- dataNorm_Coding
+
+# Calculate the variance for each gene
+gene_variance <- apply(data_matrix, 1, var)
+
+# Convert the variances to a data frame for easier sorting
+variance_df <- data.frame(Gene = rownames(dataNorm_Coding), Variance = gene_variance)
+
+# Find the top 10 genes with the highest variance
+top10_variance <- variance_df %>%
+  arrange(desc(Variance)) %>%
+  head(10) %>%
+  pull(Gene)
+
+# Print the results
+print("Genes explaining the greatest variance:")
+print(top10_variance)
+
+# Use these genes to extract data from the original data matrix
+top10_data_matrix <- data_matrix[top10_variance, ]
+
+# Plot the heatmap
+pheatmap(top10_data_matrix)
+
+# Find the genes with the lowest variance
+lowest10_variance <- variance_df %>%
+  arrange(Variance) %>%
+  head(10)
+
+print("Genes explaining the least variance:")
+print(lowest10_variance)
+
+```
+
+#### The heatmap of the top 10 variances shows that the samples on the X-axis are mainly divided into two groups, which is consistent with the Normal and Tumor groups in the data clustering. The genes on the Y-axis also clearly fall into two major clusters.
+#### Genes with high variance typically indicate significant changes in their expression levels across different samples or conditions, suggesting they may have a stronger association with the target variable. In the modeling process, selecting genes with high variance as features can enhance the predictive power of the model and avoid overfitting caused by genes with low variance.
+#### A common approach to determine which genes to include is to select genes with variance above a certain threshold (for example, choosing the top 20% of genes by variance or the top 100 genes). It is important to examine the correlation between these genes and the target variable, using Pearson correlation coefficients or other methods to assess the relationship between gene expression and the target variable.<br><br>
+
+
+# Problem 3.3
+#### Perform a PCA analysis on the data and explain is there are any data attributes that are separated into different clusters by the PCA analysis. Please explain why exploring this is important for model building.
+
+```{r}
+# Select the top 1000 genes with the highest variance
+top_genes <- head(variance_df[order(-variance_df$Variance), ], 1000)
+
+# Extract the expression data for these genes
+top_genes_data <- data_matrix[top_genes$Gene, ]
+
+# Perform PCA analysis
+pca_result <- prcomp(t(data_matrix[top_genes$Gene, ]), center = TRUE, scale. = TRUE)
+
+# Plot the PCA results
+pca_data <- as.data.frame(pca_result$x)
+pca_data$SampleType <- factor(c(rep("Normal", length(dataNormal_Target)), rep("Tumor", length(dataPrimary_Target))))
+
+# Plot the scatter plot
+ggplot(pca_data, aes(x = PC1, y = PC2, color = SampleType)) +
+  geom_point(size = 3) +
+  labs(title = "PCA of Top 1000 Genes", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+
+
+
+# Extract the gender and race information
+sample_info <- data.frame(
+  SampleType = c(rep("Normal", length(dataNormal_Target)), rep("Tumor", length(dataPrimary_Target))),
+  Gender = gender,
+  Race = race
+)
+
+# Perform PCA on gender
+gender_pca <- prcomp(t(data_matrix[top_genes$Gene, ]), center = TRUE, scale. = TRUE)
+gender_pca_data <- as.data.frame(gender_pca$x)
+gender_pca_data$Gender <- sample_info$Gender
+
+ggplot(gender_pca_data, aes(x = PC1, y = PC2, color = Gender)) +
+  geom_point(size = 3) +
+  labs(title = "PCA of Top 1000 Genes by Gender", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+
+
+
+# Perform PCA on race
+race_pca <- prcomp(t(data_matrix[top_genes$Gene, ]), center = TRUE, scale. = TRUE)
+race_pca_data <- as.data.frame(race_pca$x)
+race_pca_data$Race <- sample_info$Race
+
+ggplot(race_pca_data, aes(x = PC1, y = PC2, color = Race)) +
+  geom_point(size = 3) +
+  labs(title = "PCA of Top 1000 Genes by Race", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+
+```
+
+#### These three PCA analyses above are mainly focused on the overall gene expression pattern (Top 1000 Genes).
+#### The normal and tumor samples show clear separation in the principal component space, indicating that there are significant differences in gene expression between them. Although there are one or two points in the opposite group, the distribution is still quite clear.
+#### In the analysis by gender, the male and female samples do not appear to have a very good separation in the principal component space, suggesting that gender may not have a significant difference in gene expression, indicating that gender is not the sole determinant of the gene expression pattern.
+#### For the samples with different racial backgrounds, the black or African American group shows a more obvious separation in the principal component space, suggesting that racial background may be an important factor influencing gene expression.
+#### PCA can reduce high-dimensional data into two-dimensional or three-dimensional space, making it easier for us to visually observe the distribution and clustering of the data. This helps us better understand the intrinsic structure of the data, effectively remove noise and redundant information, and improve the signal-to-noise ratio, providing important clues for subsequent model construction. Additionally, PCA can help us identify the principal components that have the greatest impact on the target variable and uncover potential correlations among the original features. The original features corresponding to these principal components are the ones we should prioritize for inclusion in the model.<br><br>
+
+
+# Problem 4. Model development
+#### Separate into testing and training data sets.
+#### Build a logistic regression/linear regression, random forest, SVM, neural network models on the prediction of which people have kidney cancer.
+#### When building this model, Please consider what parameters can be tuned in each model and describe how you would decide how to set these parameters.
+
+```{r}
+# sample selection
+gsms <- paste0("00000000000000000000000000000000000000000000000000",
+               "11111111111111111111111111111111111111111111111111")
+sml <- strsplit(gsms, split="")[[1]]
+
+# group membership for samples
+gs <- factor(sml)
+groups <- make.names(c("Normal","Tumor"))
+levels(gs) <- groups
+sample_info <- data.frame(Group = gs, row.names = colnames(data_matrix))
+
+
+
+# Remove rows with zero and NA values
+cleaned <- data_matrix[rowSums(data_matrix != 0, na.rm = TRUE) > 0, ]
+cleaned <- cleaned[complete.cases(cleaned), ]
+
+# Ensure there are no zero rows
+cleaned <- cleaned[rowSums(cleaned == 0) == 0, ]
+
+# Transpose the data
+cleaned_data <- t(cleaned)
+
+
+
+# Calculate standard deviation and select the 1000 rows with the highest variability
+N <- 1000
+column_sd <- apply(cleaned_data, 2, sd) 
+sorted_indices <- order(column_sd, decreasing = TRUE)
+x <- cleaned_data[, sorted_indices[1:N]]
+
+
+
+# Add y column
+sample_info$y <- ifelse(sample_info$Group == "Normal", 0, 1)
+
+# Set y as grouping information
+y <- sample_info$y # Here y is the grouping information
+
+# Combine into data frame, setting y as a factor using 0 and 1 as labels
+data = cbind(y, x) %>% as.data.frame() %>%
+  mutate(y = factor(y, levels = c("0", "1")))
+
+# Split the dataset
+set.seed(1234) # Set the random seed
+data_split <- initial_split(data, strata = "y")
+data_train <- training(data_split)
+data_test <- testing(data_split)
+```
+
+```{r}
+########################################
+# 1. Logistic regression model
+########################################
+
+#create a recipe
+recipe <- recipe(data_train) %>%
+    # it is computationally too expenive to factor out y ~ . 
+    #with so many predictors
+    #so we change all columns to predictors manually
+    update_role(colnames(x), new_role="predictor")  %>%
+    #then update the role of y to outcome
+    update_role(y, new_role="outcome") %>%
+    #remove zero variance columns, minus the outcome
+    step_zv(all_numeric(), -all_outcomes()) %>%
+    #center scale the data, minus the outcome
+    step_normalize(all_numeric(), -all_outcomes())
+
+
+
+
+#set the mode to classification, regression or censored regression
+logreg_spec <- logistic_reg() %>%
+    set_engine("glm") %>%
+    set_mode("classification")
+
+#create the workflow from the recipe and the model
+logreg_workflow <- workflow() %>%
+    add_recipe(recipe) %>%
+    add_model(logreg_spec)
+
+set.seed(31416)
+#system start time
+a<-Sys.time()
+#fit the training data to the workflow
+logreg_fit <- fit(logreg_workflow, data = data_train)
+#system end time
+b<-Sys.time()
+#evaluate time
+b-a
+
+#make class predictions
+class_preds <- predict(logreg_fit, new_data = data_test,
+                            type = 'class')
+#make probability predictions
+prob_preds <- predict(logreg_fit, new_data = data_test,
+                     type = 'prob')
+
+#combine test y and results into a dataframe
+logreg_results<- data_test %>%
+  select(y) %>%
+  bind_cols(class_preds, prob_preds)
+
+#calculate the AUC
+auc<-roc_auc(logreg_results,
+        truth = y,
+        ".pred_0", #ground truth
+        event_level="first")$.estimate
+
+#confustion matrix
+conf_mat(logreg_results, truth = y, estimate = ".pred_class")
+```
+
+#### True Negative (0, 0): 8 instances were correctly predicted as negative.
+#### False Positive (0, 1): 5 instances were incorrectly predicted as positive.
+#### False Negative (1, 0): 7 instance was incorrectly predicted as negative.
+#### True Positive (1, 1): 6 instances were correctly predicted as positive.
+
+```{r}
+#get classification metrics
+classification_metrics <- metric_set(accuracy, f_meas, spec, sens, npv, ppv)
+classification_metrics(logreg_results, truth = y, estimate = ".pred_class")
+```
+
+```{r}
+#generate an ROC curve
+g_roc<- logreg_results %>%
+  roc_curve(truth=y, paste0(".pred_0"), event_level="first") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path(color="red") +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  annotate(geom="text", x=0.75, y=0.1, label=paste0("AUC ", round(auc, 3)), color="red") +
+  ggtitle(paste0("logreg ROC"))
+
+g_roc
+```
+
+#### The ROC curve also presents the same results, with an AUC of only 0.524. This indicates that the model's predictive performance is not very good.<br><br>
+
+
+```{r}
+#use parsnip to extract fit and 
+#vip to extract feature importance, with sign
+g_importance_vip<-logreg_fit%>%
+                extract_fit_parsnip() %>%
+                vip::vip(geom = "col", num_features = 20, mapping = aes(fill = Sign)) +
+                theme_bw(base_size = 14) +
+                labs(title = paste0("logreg Importance")) 
+
+g_importance_vip
+```
+
+
+```{r}
+########################
+#cross-validation for LR
+########################
+set.seed(1234)
+folds <- vfold_cv(data_train, v = 10)
+
+control <- control_resamples(save_pred = TRUE)
+
+logreg_res <- fit_resamples(logreg_spec, recipe, folds, control = control, metrics=classification_metrics)
+collect_metrics(logreg_res)
+
+highest_accuracy <- logreg_res %>%
+  select_best(metric="accuracy")  
+
+#finalize the model
+final_logreg <- finalize_model(
+        logreg_spec,
+        highest_accuracy
+        )
+
+#finalize the workflow
+final_wf <- workflow() %>%
+        add_recipe(recipe) %>%
+        add_model(final_logreg)
+
+#fit the final tuned model
+logreg_cv_fit <- fit(final_wf, data = data_train)
+
+
+#predict class, probability
+class_preds_cv <- predict(logreg_cv_fit, new_data = data_test,
+                            type = 'class')
+prob_preds_cv <- predict(logreg_cv_fit, new_data = data_test,
+                     type = 'prob')
+
+#collate results
+logreg_cv_results<- data_test %>%
+  select(y) %>%
+  bind_cols(class_preds_cv, prob_preds_cv)
+
+classification_metrics(logreg_cv_results, truth = y, estimate = ".pred_class")
+```
+
+#### The accuracy is 0.5384615, indicating that the overall accuracy of this model in the classification task is average.
+#### The F1 score is 0.5714286, suggesting that the model's performance in balancing precision and recall is average.
+#### The specificity (spec) is 0.4615385, indicating that the model's ability to correctly identify negative samples is relatively weak.
+#### The sensitivity (sens) is 0.6153846, which means the model's ability to identify positive samples is relatively stronger.
+#### The negative predictive value (npv) is 0.5454545, implying that the proportion of actual negative samples among the samples predicted as negative by the model is average.
+#### The positive predictive value (ppv) is 0.5333333, suggesting that the proportion of actual positive samples among the samples predicted as positive by the model is also relatively average.<br><br>
+
+
+```{r}
+# The AUC of the final cv model
+auc_cv <- roc_auc(logreg_cv_results, truth = y, ".pred_0", event_level = "first")$.estimate
+
+# Generate ROC curve
+g_roc_cv <- logreg_cv_results %>%
+  roc_curve(truth = y, paste0(".pred_0"), event_level = "first") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path(color = "blue") +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  labs(title = "Final Model ROC Curve") +
+  annotate(geom = "text", x = 0.75, y = 0.1, label = paste0("AUC ", round(auc_cv, 3)), color = "blue")
+
+g_roc_cv
+
+```
+
+#### For small datasets, the choice to use cross-validation is to better evaluate the model's generalization performance, obtain more reliable performance metrics, and also avoid the model from overfitting the training data. 
+#### After performing cross-validation, it can be seen that the logistic regression model training is indeed not good, regardless of the accuracy, F1 score or AUC, which are all quite average. This may be due to the small size of the dataset, which could lead to the model performing consistently across different folds, making it difficult to observe any differences. It might be worth trying different feature engineering and cross-validation methods to see if more meaningful differences can be obtained.<br><br>
+
+
+```{r}
+##################
+# 2. For SVM model
+##################
+
+#create a recipe
+recipe <- recipe(data_train) %>%
+  # it is computationally too expenive to factor out y ~ . 
+  #with so many predictors
+  #so we change all columns to predictors manually
+  update_role(colnames(x), new_role="predictor")  %>%
+  #then update the role of y to outcome
+  update_role(y, new_role="outcome") %>%
+  #remove zero variance columns, minus the outcome
+  step_zv(all_numeric(), -all_outcomes()) %>%
+  #center scale the data, minus the outcome
+  step_normalize(all_numeric(), -all_outcomes())
+#estimate the required parameters
+
+
+#######################
+#Tuning a model for SVM 
+#######################
+
+#in svm , the cost is tunable, rbf_gisma
+#either set bootstraps or cross-validation
+
+# Set cross-validation
+# Use vfold_cv to split the dataset into multiple folds for model performance evaluation
+set.seed(1234)
+folds <- vfold_cv(data_train, strata = y)
+
+# Define a grid svm_grid that includes different values of the hyperparameters cost and rbf_sigma to be tuned.
+svm_grid <- expand.grid(cost = c(-10, 5), rbf_sigma = c(0.001,0.005,0.01,0.05,0.1,0.5,1))
+
+#in the model spec, change cost to tune()
+tune_spec <- svm_rbf(cost = tune(), rbf_sigma=tune()) %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+#update the workflow spec with the new model
+tune_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(tune_spec) 
+
+#parallelize to 2 cores (or more, depending on machine)
+doParallel::registerDoParallel(2)
+
+set.seed(1234)
+#system start time
+a<-Sys.time()
+#run the tuning grid
+svm_grid <- tune_grid(
+  tune_workflow,
+  resamples = folds,  
+  grid=svm_grid
+)
+#system end time
+b<-Sys.time()
+b-a
+```
+
+
+```{r}
+#evaluate the tune: does changing the hyperparameters alter performance?
+svm_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(cost, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+#get the tuning metrics
+svm_metrics<-svm_grid %>%
+  collect_metrics()
+
+# Plot the effect of rbf_sigma.
+ggplot(svm_metrics %>% filter(.metric %in% c("roc_auc", "accuracy")), 
+       aes(x = factor(rbf_sigma), y = mean, color = .metric)) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), alpha = 0.5) +
+  geom_line(size = 1.5, aes(group = .metric)) +
+  labs(x = "RBF Sigma", y = "Mean Metric", color = "Metric") +
+  theme(legend.position = "bottom") +
+  ggtitle("Effect of rbf sigma on Model Performance") +
+  scale_x_discrete()
+```
+
+```{r}
+#pick the best cost on highest roc_auc or accuracy
+highest_roc_auc <- svm_grid %>%
+  select_best(metric="roc_auc")  
+
+#finalize the model
+final_svm <- finalize_model(
+  tune_spec,
+  highest_roc_auc
+)
+
+#finalize the workflow
+final_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(final_svm)
+
+#fit the final tuned model
+svm_tune_fit <- fit(final_wf, data = data_train)
+
+#predict class, probability
+class_preds_tune <- predict(svm_tune_fit, new_data = data_test,
+                            type = 'class')
+prob_preds_tune <- predict(svm_tune_fit, new_data = data_test,
+                           type = 'prob')
+
+#collate results
+svm_tune_results<- data_test %>%
+  select(y) %>%
+  bind_cols(class_preds_tune, prob_preds_tune)
+
+#calculate AUC
+auc_tune<-roc_auc(svm_tune_results,
+                  truth = y,
+                  ".pred_0", 
+                  event_level="first")$.estimate
+
+#confusion matrix and metrics
+conf_mat(svm_tune_results, truth = y, estimate = ".pred_class")
+```
+
+#### True Negative (0, 0): 13 instances were correctly predicted as negative.
+#### False Positive (0, 1): 0 instances were incorrectly predicted as positive.
+#### False Negative (1, 0): 3 instance was incorrectly predicted as negative.
+#### True Positive (1, 1): 10 instances were correctly predicted as positive.<br><br>
+
+
+```{r}
+classification_metrics <- metric_set(accuracy, f_meas, spec, sens, npv, ppv)
+classification_metrics(svm_tune_results, truth = y, estimate = ".pred_class")
+```
+
+#### Based on these estimates, the performance of accuracy, F1 score, specificity, sensitivity, etc., is much better than the previous LR model, with a range of 0.76-1.<br><br>
+
+
+```{r}
+#tune ROC curve
+g_roc_tune<- svm_tune_results %>%
+  roc_curve(truth=y, paste0(".pred_0"), event_level="first") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path(color="red") +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  annotate(geom="text", x=0.75, y=0.1, label=paste0("AUC ", round(auc_tune, 3)), color="red") +
+  ggtitle(paste0("Tuned svm ROC"))
+
+g_roc_tune
+```
+
+```{r}
+#vip importance unavailable
+
+explainer_tune <- 
+  explain_tidymodels(
+    svm_tune_fit, 
+    data = data_train, 
+    y = data_train$y,
+    verbose = FALSE
+  )
+a<-Sys.time()
+breakdown_tune <- predict_parts(explainer = explainer_tune, new_observation = data_test)
+b<-Sys.time()
+b-a
+plot(breakdown_tune)
+
+
+
+g_importance_tune<-
+  breakdown_tune %>%
+  group_by(variable) %>%
+  mutate(mean_val = mean(contribution)) %>%
+  ungroup() %>%
+  arrange(desc(abs(mean_val))) %>% slice_head(n=20) %>%
+  mutate(variable = fct_reorder(variable, abs(mean_val))) %>%
+  ggplot(aes(contribution, variable, fill = mean_val > 0)) +
+  geom_col(data = ~distinct(., variable, mean_val), 
+           aes(mean_val, variable), 
+           alpha = 0.5) +
+  geom_boxplot(width = 0.5) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_viridis_d() +
+  labs(y = NULL)
+
+g_importance_tune
+```
+
+#### In this case, the cost (-10, 5) and rbf_sigma (0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1) parameters were used to tune the SVM model.
+#### Based on the graphs of cost and rbf_sigma, the optimal parameter is cost=5 to achieve the best model performance. The "rbf sigma on Model Performance" graph shows that as rbf_sigma increases, the model performance first improves and then declines. When rbf_sigma is around 0.01, the model's performance indicator reaches the highest value. Therefore, selecting rbf_sigma=0.01 as the optimal parameter can achieve the best model performance.
+#### In summary, the optimal parameter combination is cost = 5 and rbf_sigma = 0.01. Using this set of parameters can achieve the best model performance.
+#### From the result of AUC = 1, it can be seen that the optimal model perfectly discriminates the positive and negative classes.<br><br>
+
+
+```{r}
+##############################
+# 3. For neural network models
+##############################
+
+#create a recipe
+recipe <- recipe(data_train) %>%
+  # it is computationally too expenive to factor out y ~ . 
+  #with so many predictors
+  #so we change all columns to predictors manually
+  update_role(colnames(x), new_role="predictor")  %>%
+  #then update the role of y to outcome
+  update_role(y, new_role="outcome") %>%
+  #remove zero variance columns, minus the outcome
+  step_zv(all_numeric(), -all_outcomes()) %>%
+  #center scale the data, minus the outcome
+  step_normalize(all_numeric(), -all_outcomes())
+#estimate the required parameters
+
+
+######################
+#Tuning a model for NN
+######################
+
+#in nnet, they layers and penalty tuneable
+#either set bootstraps or cross-validation
+
+# Set a random seed for reproducibility
+set.seed(1234)
+
+# Use cross-validation to split the training data into folds
+folds <- vfold_cv(data_train, strata = y)
+
+# Define a grid of hidden unit configurations to tune
+grid_hidden_units <- tribble(
+  ~hidden_units,
+  c(8, 8),       # Two hidden layers with 8 units each
+  c(8, 8, 8),    # Three hidden layers with 8 units each
+  c(16, 16),     # Two hidden layers with 16 units each
+  c(16, 16, 16), # Three hidden layers with 16 units each
+  # c(32, 32),     # Two hidden layers with 32 units each
+  # c(32, 32, 32), # Three hidden layers with 32 units each
+  # c(64, 64),     # Two hidden layers with 64 units each
+  # c(64, 64, 64)  # Three hidden layers with 64 units each
+)
+
+# Define a grid of regularization penalty values to tune
+grid_penalty <- tibble(penalty = c(0.01, 0.02))
+
+# Combine the hidden unit and penalty grids using the `crossing()` function
+grid <- grid_hidden_units |>
+  crossing(grid_penalty)
+
+# Display the resulting grid
+# grid
+
+tune_spec <- mlp(epochs = 1000, hidden_units = tune(), penalty = tune(), learn_rate = 0.1) %>%
+  set_engine("brulee", importance = "permutation") %>% 
+  set_mode("classification")
+
+#update the workflow spec with the new model
+tune_workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(tune_spec) 
+
+#parallelize to 2 cores (or more, depending on machine)
+doParallel::registerDoParallel(2)
+
+set.seed(1234)
+#system start time
+a<-Sys.time()
+#run the tuning grid
+nnet_grid <- tune_grid(
+  tune_workflow,
+  resamples = folds,
+  grid = grid
+)
+#system end time
+b<-Sys.time()
+b-a
+
+#evaluate the tune: does changing the hyperparameters alter performance?
+nnet_grid %>%
+  collect_metrics() %>%
+  mutate(hidden_units=paste0(hidden_units)) %>%
+  ggplot(aes(interaction(unlist(hidden_units), penalty), mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size=1))
+```
+
+#### X-axis parameter settings:
+#### hidden_units = (8,8), penalty = 0.01)
+#### hidden_units = (8,8), penalty = 0.02)
+#### hidden_units = (8,8,8), penalty = 0.01)
+#### hidden_units = (8,8,8), penalty = 0.02)
+#### hidden_units = (16,16), penalty = 0.01)
+#### hidden_units = (16,16), penalty = 0.02)
+#### hidden_units = (16,16,16), penalty = 0.01)
+#### hidden_units = (16,16,16), penalty = 0.02)
+#### The best parameter settings are hidden_units = (8,8), penalty = 0.02.<br><br>
+
+
+```{r}
+#get the tuning metrics
+nnet_metrics<-nnet_grid %>%
+  collect_metrics()
+
+#pick the best cost on highest roc_auc or accuracy
+highest_roc_auc <- nnet_grid %>%
+  select_best(metric="roc_auc")  
+
+
+mlp_best_list <- highest_roc_auc |> as.list()
+mlp_best_list$hidden_units <- mlp_best_list$hidden_units |> unlist()
+
+#finalize the model
+final_nnet <- finalize_model(
+  tune_spec,
+  mlp_best_list
+)
+
+#finalize the workflow
+final_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(final_nnet)
+
+#fit the final tuned model
+nnet_tune_fit <- fit(final_wf, data = data_train)
+
+#predict class, probability
+class_preds_tune <- predict(nnet_tune_fit, new_data = data_test,
+                            type = 'class')
+prob_preds_tune <- predict(nnet_tune_fit, new_data = data_test,
+                           type = 'prob')
+
+#collate results
+nnet_tune_results<- data_test %>%
+  select(y) %>%
+  bind_cols(class_preds_tune, prob_preds_tune)
+
+#calculate AUC
+auc_tune<-roc_auc(nnet_tune_results,
+                  truth = y,
+                  ".pred_0", 
+                  event_level="first")$.estimate
+
+#confusion matrix and metrics
+conf_mat(nnet_tune_results, truth = y, estimate = ".pred_class")
+```
+
+#### The results of the confusion matrix and metrics all indicate accurate predictions perfectly.<br><br>
+
+
+```{r}
+classification_metrics <- metric_set(accuracy, f_meas, spec, sens, npv, ppv)
+classification_metrics(nnet_tune_results, truth = y, estimate = ".pred_class")
+```
+
+#### The estimated values for the model's accuracy, F1 score, specificity, sensitivity, and other metrics are all 1. This suggests that the model's performance on these metrics is very good.<br><br>
+
+
+```{r}
+#tune ROC curve
+g_roc_tune<- nnet_tune_results %>%
+  roc_curve(truth=y, paste0(".pred_0"), event_level="first") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path(color="red") +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  annotate(geom="text", x=0.75, y=0.1, label=paste0("AUC ", round(auc_tune, 3)), color="red") +
+  ggtitle(paste0("Tuned nnet ROC"))
+
+g_roc_tune
+```
+
+
+```{r}
+#vip importance unavailable
+
+
+#no vip model importance for nnet, use DALEX
+
+explainer_tune <- 
+  explain_tidymodels(
+    nnet_tune_fit, 
+    data = data_train, 
+    y = data_train$y,
+    verbose = FALSE
+  )
+a<-Sys.time()
+breakdown_tune <- predict_parts(explainer = explainer_tune, new_observation = data_test)
+b<-Sys.time()
+b-a
+plot(breakdown_tune)
+
+
+g_importance_tune<-
+  breakdown_tune %>%
+  group_by(variable) %>%
+  mutate(mean_val = mean(contribution)) %>%
+  ungroup() %>%
+  arrange(desc(abs(mean_val))) %>% slice_head(n=20) %>%
+  mutate(variable = fct_reorder(variable, abs(mean_val))) %>%
+  ggplot(aes(contribution, variable, fill = mean_val > 0)) +
+  geom_col(data = ~distinct(., variable, mean_val), 
+           aes(mean_val, variable), 
+           alpha = 0.5) +
+  geom_boxplot(width = 0.5) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_viridis_d() +
+  labs(y = NULL)
+
+g_importance_tune
+
+```
+
+#### From the nnet_grid plot, we can know the best parameter settings are hidden_units = (8,8), penalty = 0.02. The confusion matrix and metrics of the model  all indicate accurate predictions perfectly.The model’s AUC, accuracy, F1 score, specificity, sensitivity, and other metrics are all 1, representing that the model’s performance on these metrics is quite good.
+#### The adjustable parameters of neural network models are two: hidden_units and penalty.
+#### The number of hidden units (hidden_units) determines the complexity and expressive power of the neural network. A balance between overfitting and underfitting is usually needed.
+#### The regularization parameter (penalty) can control the degree of model fitting to the training data, prevent overfitting, and thus improve the model's generalization capability.
+#### There are two common methods for determining how to set these parameters: grid search and random search. In this case, grid search, a common and effective hyperparameter tuning method, was used. In contrast, random search involves randomly sampling some points in the parameter space for evaluation, which is more suitable for high-dimensional parameter spaces.<br><br>
+
+
+```{r}
+############################
+# 4. For random forest model
+############################
+
+#create a recipe
+recipe <- recipe(data_train) %>%
+    # it is computationally too expenive to factor out y ~ . 
+    #with so many predictors
+    #so we change all columns to predictors manually
+    update_role(colnames(x), new_role="predictor")  %>%
+    #then update the role of y to outcome
+    update_role(y, new_role="outcome") %>%
+    #remove zero variance columns, minus the outcome
+    step_zv(all_numeric(), -all_outcomes()) %>%
+    #center scale the data, minus the outcome
+    step_normalize(all_numeric(), -all_outcomes())
+
+######################
+#Tuning a model for RF
+######################
+
+#in rf, the trees, mtry, min_n are tunable
+
+#either set bootstraps or cross-validation
+set.seed(1234)
+folds <- vfold_cv(data_train, strata = y)
+
+#in the model spec, change hyperparameters to tune()
+tune_spec <- rand_forest(trees = tune(), mtry = tune(), min_n = tune()) %>%
+             set_engine("randomForest", importance=TRUE) %>%  
+             set_mode("classification")
+
+#mtry is dependent on number of columns
+rf_param <- extract_parameter_set_dials(tune_spec) %>% 
+  finalize(data_train)
+
+#set a tree grid
+tree_grid<-grid_regular(rf_param, levels=4)
+
+
+
+
+#update the workflow spec with the new model
+tune_workflow <- workflow() %>%
+    add_recipe(recipe) %>%
+    add_model(tune_spec)
+
+#parallelize to 2 cores (or more, depending on machine)
+doParallel::registerDoParallel(2)
+
+set.seed(1234)
+#system start time
+a<-Sys.time()
+#run the tuning grid
+rf_grid <- tune_grid(
+  tune_workflow,
+  resamples = folds,
+  grid=tree_grid
+)
+#system end time
+b<-Sys.time()
+b-a
+
+#evaluate the tune: does changing the hyperparameters alter performance?
+autoplot(rf_grid)
+```
+
+#### The autoplot chart displays the performance metrics of the random forest model under different Minimal Node Size and the number of Randomly Selected Predictors.
+#### From left to right, the Minimal Node Size is 2, 14, 27, and 40 respectively. As the Minimal Node Size increases, the model complexity decreases, but this may lead to underfitting. Smaller Minimal Node Size will produce deeper trees, which may result in overfitting, while larger Minimal Node Size will produce shallower trees, which may lead to underfitting.
+#### The chart shows three performance metrics: ROC AUC, Brier score, and accuracy. As the Minimal Node Size increases, the performance metrics exhibit different trends. The x-axis represents the number of predictors used, ranging from 250 to 1000. As the number of predictors increases, the model performance generally improves. The legend on the right shows the impact of the number of trees (1, 667, 1333, and 2000) on the model performance. The more trees, the higher the model complexity, but this may also lead to overfitting. Overall, this chart demonstrates the performance of the random forest model under different hyperparameter settings, which can help us choose the optimal parameter combination.
+#### The chart suggests that a single tree does not perform well. The accuracy difference among 667, 1333, and 2000 trees is not significant, and they are all close to 1. When the Minimal Node Size is 2 or 14, the model achieves relatively high ROC AUC and accuracy, and the Brier Score is also relatively low. Compared to the case where the Minimal Node Size is 27, the range of 2-14 seems to better balance the model complexity and performance<br><br>
+
+
+```{r}
+#get the tuning metrics
+rf_metrics<-rf_grid %>%
+  collect_metrics()
+
+#pick the best k based on roc_auc or accuracy
+highest_roc_auc <- rf_grid %>%
+  select_best(metric="roc_auc")  
+
+highest_roc_auc
+```
+
+#### The optimal hyperparameter values for the random forest model:
+#### mtry represents the number of features to consider at each split node. The optimal value here is 1001, meaning that the model will consider all 1001 features when splitting each node.
+#### trees specifies the number of decision trees in the random forest. The optimal value is 667, indicating that the final model is composed of 667 decision trees.
+#### min_n represents the minimum number of samples required in each leaf node. The optimal value is 2, meaning that each leaf node must contain at least 2 samples.<br><br>
+
+
+```{r}
+#finalize the model
+final_rf <- finalize_model(
+        tune_spec,
+        highest_roc_auc
+        )
+
+#finalize the workflow
+final_wf <- workflow() %>%
+        add_recipe(recipe) %>%
+        add_model(final_rf)
+
+#fit the final tuned model
+rf_tune_fit <- fit(final_wf, data = data_train)
+
+#predict class, probability
+class_preds_tune <- predict(rf_tune_fit, new_data = data_test,
+                            type = 'class')
+prob_preds_tune <- predict(rf_tune_fit, new_data = data_test,
+                     type = 'prob')
+
+#collate results
+rf_tune_results<- data_test %>%
+  select(y) %>%
+  bind_cols(class_preds_tune, prob_preds_tune)
+
+#calculate AUC
+auc_tune<-roc_auc(rf_tune_results,
+        truth = y,
+        ".pred_0", 
+        event_level="first")$.estimate
+
+#confusion matrix and metrics
+conf_mat(rf_tune_results, truth = y, estimate = ".pred_class")
+```
+
+#### The results of the confusion matrix and metrics all indicate accurate predictions perfectly.<br><br>
+
+
+```{r}
+classification_metrics <- metric_set(accuracy, f_meas, spec, sens, npv, ppv)
+classification_metrics(rf_tune_results, truth = y, estimate = ".pred_class")
+```
+
+#### The estimated values for the model's accuracy, F1 score, specificity, sensitivity, and other metrics are all 1. This suggests that the model's performance on these metrics is very good.<br><br>
+
+
+```{r}
+#tune ROC curve
+g_roc_tune<- rf_tune_results %>%
+  roc_curve(truth=y, paste0(".pred_0"), event_level="first") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path(color="red") +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  annotate(geom="text", x=0.75, y=0.1, label=paste0("AUC ", round(auc_tune, 3)), color="red") +
+  ggtitle(paste0("Tuned rf ROC"))
+
+g_roc_tune
+```
+
+
+```{r}
+#vip importance
+g_importance_vip_tune<-rf_tune_fit %>%
+                extract_fit_parsnip() %>%
+                vip::vip(geom = "col", num_features = 20) +
+                theme_bw(base_size = 14) +
+                labs(title = paste0("rf Importance"))
+
+g_importance_vip_tune
+```
+
+#### The code "tune_spec <- rand_forest(trees = tune(), mtry = tune(), min_n = tune())" in the random forest model adjusts the hyperparameters.The three hyperparameters trees, mtry, and min_n are tuned during the process.
+#### "trees" represents the number of trees. As the number of trees increases, the model complexity and predictive power usually improve, but it may also lead to overfitting. "mtry" represents the number of features randomly selected during the splitting process of each tree. This value is usually the square root of the total number of features (for classification problems) or one-third of the total number of features (for regression problems). "min_n" represents the minimum number of samples required in each leaf node of the tree. The setting of this value will affect the growth of the tree and the complexity of the model. A smaller min_n value will make the tree deeper, which may lead to overfitting, while a larger min_n value will make the tree shallower, which may lead to underfitting.
+#### During the process, the vfold_cv() function is used to create cross-validation folds, which helps evaluate the model's performance on new data and avoid overfitting. The grid_regular() function is also used to create a grid containing different parameter combinations, systematically exploring the parameter space to find the optimal combination.<br><br>
+
+
+# Problem 4.1
+#### Compare the performance of each model and describe why you think one model performed better
+than the others.
+
+#### In this project, I think the performance of neural network models and random forest models should be better than other models.
+#### Comparing comprehensively, the performance of SVM, NN and RF models are all better than the Logistic Regression (LR) model.
+#### The overall accuracy of the LR model is 53.85%, the F1 score is 0.5714, the specificity is relatively low at only 46.15%, and the sensitivity is relatively higher at 61.54%. These values all indicate that this model's ability to identify positive and negative samples is relatively weak, and the accuracy is not high. In contrast, LR may not be able to fully capture the underlying patterns for non-linear relationships or complex data patterns, so its performance is poorer. The LR model may be more suitable for simple linear relationships.
+#### The various indicators of the SVM model, such as accuracy, F1 score, specificity, and sensitivity, are all between 0.76-1, which are better than the Logistic Regression model, but still inferior to NN and RF. Although SVM is a powerful non-linear classifier that can find the optimal separating hyperplane in high-dimensional feature space, for complex non-linear problems, it may require careful selection of the kernel function and parameter tuning.
+#### The performance of the NN and RF models is the best, with all indicators reaching the perfect level of 1. Especially for NN, it can automatically extract meaningful features, and fortunately, the tidymodels used this time can express the "interpretability" that is not easy to show in the original NN.
+#### Random Forest (RF), on the other hand, improves the stability and generalization ability of the model by aggregating multiple decision trees, and performs excellently in many problems. In addition, the random forest can be further optimized by adjusting hyperparameters such as the number of trees and feature selection.<br><br>
+
+
+# Problem 5
+#### Develop a predictive model for the classification of some component of cancer samples. This could include answering questions mentioned above including: Can we predict what stage the tumor is in? Can we predict if a tissue sample is from a tumor or normal tissue? Is there an ethnicity component to the gene expression profiles? Can we predict days to death or vital status? The precise question you answer in this assignment is open to your interpretation yet must contain rationale data driven reasons for choosing which question to answer.
+
+```{r}
+# Redefine sample_info, with gender as the y variable
+sample_info$y <- factor(gender)  # Convert gender to a factor
+
+# Combine the data, with gender as the y variable
+data_with_gender <- cbind(y = sample_info$y, x)
+
+# Split the dataset
+set.seed(1234) # Set the random seed
+data_split <- initial_split(data, strata = "y")
+data_train <- training(data_split)
+data_test <- testing(data_split)
+```
+
+```{r}
+#create a recipe
+recipe <- recipe(data_train) %>%
+    # it is computationally too expenive to factor out y ~ . 
+    #with so many predictors
+    #so we change all columns to predictors manually
+    update_role(colnames(x), new_role="predictor")  %>%
+    #then update the role of y to outcome
+    update_role(y, new_role="outcome") %>%
+    #remove zero variance columns, minus the outcome
+    step_zv(all_numeric(), -all_outcomes()) %>%
+    #center scale the data, minus the outcome
+    step_normalize(all_numeric(), -all_outcomes()) 
+
+
+#create a model spec (trees, mtry, and min_n are the hyperparameters)
+#set the engine (randomForest)
+#set the mode to classification, regression or censored regression
+rf_spec <- rand_forest(trees = 1e3, mtry = sqrt(ncol(x)), min_n = 5) %>%
+           set_engine("randomForest", importance=TRUE) %>%  
+           set_mode("classification")
+
+#create the workflow from the recipe and the model
+rf_workflow <- workflow() %>%
+    add_recipe(recipe) %>%
+    add_model(rf_spec)
+
+set.seed(31416)
+#system start time
+a<-Sys.time()
+#fit the training data to the workflow
+rf_fit <- fit(rf_workflow, data = data_train)
+#system end time
+b<-Sys.time()
+#evaluate time
+b-a
+
+
+#make class predictions
+class_preds <- predict(rf_fit, new_data = data_test,
+                            type = 'class')
+#make probability predictions
+prob_preds <- predict(rf_fit, new_data = data_test,
+                     type = 'prob')
+
+#combine test y and results into a dataframe
+rf_results<- data_test %>%
+  select(y) %>%
+  bind_cols(class_preds, prob_preds)
+
+#calculate the AUC
+auc<-roc_auc(rf_results,
+        truth = y,
+        ".pred_0", #ground truth
+        event_level="first")$.estimate
+
+#confustion matrix
+conf_mat(rf_results, truth = y, estimate = ".pred_class")
+```
+
+#### The performance metrics of this classification model are all outstanding, with an accuracy as high as 100%, making it highly suitable for practical applications.<br><br>
+
+
+```{r}
+#get classification metrics
+classification_metrics <- metric_set(accuracy, f_meas, spec, sens, npv, ppv)
+classification_metrics(rf_results, truth = y, estimate = ".pred_class")
+```
+
+#### Accuracy: The overall accuracy of the model is 1.0,sensitivity and specificity both are 1.0, indicating that the model’s predictions for the two classes are highly accurate. <br><br>
+
+
+```{r}
+#generate an ROC curve
+g_roc<- rf_results %>%
+  roc_curve(truth=y, paste0(".pred_0"), event_level="first") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path(color="red") +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  annotate(geom="text", x=0.75, y=0.1, label=paste0("AUC ", round(auc, 3)), color="red") +
+  ggtitle(paste0("rf ROC for gender"))
+
+g_roc
+```
+
+
+```{r}
+g_importance_vip<-rf_fit %>%
+                extract_fit_parsnip() %>%
+                vip::vip(geom = "col", num_features = 20) +
+                theme_bw(base_size = 14) +
+                labs(title = paste0("rf Importance for gender"))
+
+g_importance_vip
+```
+
+#### I chose a random forest model to predict gender, which is a classification problem focused on predicting the target variable (y) based on the features (x). Therefore, I reset the sample_info for gender and converted the gender variable into a factor type. Then, the dataset was randomly split into training and testing sets to evaluate the model’s generalization ability.
+#### It can be observed that the overall accuracy of the model is 100%, with all test samples being correctly predicted. This is a very high accuracy rate, but it is crucial to note the risk of overfitting. Both sensitivity and specificity are 1.0, indicating that the model’s predictions for the two classes are very accurate. The ROC curve is plotted by calculating the true positive rate and false positive rate, and the AUC (area under the curve) is 1, which indicates that the model’s predictive ability is very strong and can perfectly distinguish between the two classes. Therefore, it can be concluded that this model has high accuracy and stability.<br><br>
+
+
+```{r}
+# record end time
+end_time <- Sys.time()
+
+# execution time
+execution_time <- end_time - start_time
+execution_time
+
+```
+
