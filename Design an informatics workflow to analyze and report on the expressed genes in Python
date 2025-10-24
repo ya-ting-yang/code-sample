@@ -1,0 +1,173 @@
+#########################################################################################
+# 
+# Author: Ya-Ting Yang
+# 
+# The workflow.py script does analysis of fastq file, aligns it with reference genome file to create a sam file, converts the sam to a bam file   
+# 
+#
+from Bio import SeqIO
+import sys, subprocess, os
+
+# Analyzes the fastq file.
+# input: fastq file path, analysis output file
+def analyzeQuality(fastq_file, analysis_out):
+    total_reads = 0
+    total_quality = 0
+    total_bases = 0
+
+    # read in fast q file and process each record
+    for record in SeqIO.parse(fastq_file, "fastq"):
+        total_reads += 1
+        qualities = record.letter_annotations["phred_quality"]
+        total_quality += sum(qualities)
+        total_bases += len(qualities)
+
+    # Calculate average quality score per base
+    average_quality = total_quality / total_bases if total_bases > 0 else 0
+    
+    filename = os.path.basename(fastq_file)
+    analysis_out.write(f"{filename} Analysis\n")
+    total_reads_str = f"Total reads: {total_reads}"
+    avg_qual_base_str = f"Average quality score per base: {average_quality:.2f}"
+    analysis_out.write(f"{total_reads_str}\n")
+    analysis_out.write(f"{avg_qual_base_str}\n")
+    #print(f"For {os.path.basename(fastq_file)}")
+    print(f"{total_reads_str}")
+    print(f"{avg_qual_base_str}")
+    
+    # Calculate the probability of error
+    probability_of_error = 10 ** (-average_quality / 10)
+    # Calculate the percentage error
+    percentage_error = probability_of_error * 100
+    # Calculate the confidence level
+    confidence_level = 100 - percentage_error
+    
+    # Present the results
+    prob_err_str = f"Probability of Error: 1 in {1/probability_of_error:.0f} ({percentage_error:.4f}%)"
+    conf_err_str = f"Confidence Level: {confidence_level:.2f}% accuracy in base calls"
+    print(f"{prob_err_str}")
+    print(f"{conf_err_str}")
+    analysis_out.write(f"{prob_err_str}\n")
+    analysis_out.write(f"{conf_err_str}\n\n")
+    #print("\n")
+
+# Run alignment of fastq data with reference genome using BWA
+# inputs: fastq file, reference genome, output sam file name
+# output: sam file
+def run_alignment(fastq_file, reference_genome, output_sam):
+    with open(output_sam, "w") as outputfile:
+
+        # BWA alignment command
+        bwa_command = f"bwa mem {reference_genome} {fastq_file}"
+         # Check if index files exist
+        index_files = [f"{reference_genome}.bwt", f"{reference_genome}.pac", f"{reference_genome}.ann", f"{reference_genome}.sa"]
+        if not all(os.path.exists(idx_file) for idx_file in index_files):
+            print("reference genome index files not found in the directory.")
+            print("Attempting to index reference file, this could take a while.")
+            bwa_idx_command = f"bwa index {reference_genome}"
+            try:
+                subprocess.run(bwa_idx_command, shell=True, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Error during BWA indexing: {e}")
+            #return
+            print(f"Successfully index reference file: {reference_genome}")
+        
+        try:
+            # Call subprocess for using BWA
+            subprocess.run(bwa_command, shell=True, check=True, stdout=outputfile)
+            print(f"Successfully aligned {fastq_file} to {reference_genome}. Output SAM: {output_sam}")
+        except subprocess.CalledProcessError as e:
+            print(f"Error during BWA alignment: {e}")
+    outputfile.close
+
+# Convert sam file to bam file using samtools.
+# inputs: sam file name, bam file output name
+# output: bam file
+def convert_sam_to_bam(sam_file, bam_file):
+    with open(bam_file, "w") as outputfile:
+        # Using samtools to convert SAM to BAM
+        sam_to_bam_command = f"samtools view -S -b {sam_file}"
+        print(sam_to_bam_command)
+        try:
+            subprocess.run(sam_to_bam_command, shell=True, check=True, stdout=outputfile)
+            print(f"Successfully converted {sam_file} to BAM. Output BAM: {bam_file}")
+        except subprocess.CalledProcessError as e:
+            print(f"Error during SAM to BAM conversion: {e}")
+    outputfile.close()
+
+# Sort bam file using samtools.
+# input bam file, sorted bam file name
+# output sorted bam file
+def sort_bam(bam_file, sorted_bam_file):
+    # Sort BAM files using samtools
+    sort_command = f"samtools sort {bam_file} -o {sorted_bam_file}"
+    
+    try:
+        subprocess.run(sort_command, shell=True, check=True)
+        print(f"Successfully sorted {bam_file}. Output sorted BAM: {sorted_bam_file}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error during BAM sorting: {e}")
+
+# Indexes sorted bam file using samtools.
+# input: sorted bam file
+# output: index of sorted bam file, with bai extension 
+def index_bam(sorted_bam_file):
+    # Create an index file for the BAM file using samtools.
+    index_command = f"samtools index {sorted_bam_file}"
+    
+    try:
+        subprocess.run(index_command, shell=True, check=True)
+        print(f"Successfully indexed {sorted_bam_file}.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error during BAM indexing: {e}")
+
+# runs all steps from fastq to sorted, indexed bam
+# input fastq file, reference fna, analysis output 
+def processFastq(fastq, reference_genome, analysis_out):
+     # get base fast q file name
+    fastqName = os.path.basename(fastq)
+    print(f"Processing fastq file {fastqName}")
+    analyzeQuality(fastq_file, analysis_out)
+    
+    # remove file ext
+    baseFastqName = os.path.splitext(fastqName)[0]
+
+    # create output file names
+    output_sam = baseFastqName+".sam"
+    output_bam = baseFastqName+".bam"
+    sorted_bam = baseFastqName+"_sorted.bam"
+
+    # Align the FASTQ files.
+    run_alignment(fastq, reference_genome, output_sam)
+    
+    # Convert the SAM file to BAM.
+    convert_sam_to_bam(output_sam, output_bam)
+
+    # Sort the BAM file.
+    sort_bam(output_bam, sorted_bam)
+
+    # Create an index for the sorted BAM file.
+    index_bam(sorted_bam)
+
+if __name__ == "__main__":
+    # open file for writing analysis
+    analysis_out = open("analysis_output.txt", "w")
+
+    n = len(sys.argv)
+    if (n == 1): # no arguments, assume samples under ngs_tumor_sample1 folder
+        reference_genome = "GCF_000001405.26_GRCh38_genomic.fna"  # The ref. file
+
+        fastq_file = "ngs_tumor_sample1/sample1_R1.fastq" # FASTQ file path
+        processFastq(fastq_file, "GCF_000001405.26_GRCh38_genomic.fna", analysis_out)
+        print("\n")
+        fastq_file = "ngs_tumor_sample1/sample1_R2.fastq"
+        processFastq(fastq_file, "GCF_000001405.26_GRCh38_genomic.fna", analysis_out)
+    elif(n == 3): # 2 arguments, assume user specified fastq and reference file
+        fastq_file = sys.argv[1]
+        reference_genome = sys.argv[2]
+        processFastq(fastq_file, reference_genome, analysis_out)
+    else:
+        print("Invalid number of args.")
+        print("    python3 workflow.py   or")
+        print("    python3 workflow.py <fastq> <reference fna>" )
+    analysis_out.close()
