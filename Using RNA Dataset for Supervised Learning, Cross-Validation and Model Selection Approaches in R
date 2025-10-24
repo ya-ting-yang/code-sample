@@ -1,0 +1,1004 @@
+
+---
+title: "Using RNA Dataset for Supervised Learning, Cross-Validation and Model Selection Approaches"
+author: "Ya-Ting Yang"
+date: "2025-03-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# record start time
+start_time <- Sys.time()
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+library(GEOquery)
+library(DESeq2)
+library(Biobase)
+library(tidymodels)
+library(tidyr) 
+library(kernlab)
+library(vip)
+library(ggplot2) 
+library(DALEXtra)
+library(modeldata)
+library(forcats)
+library(dplyr)  
+library(doParallel)
+library(foreach)
+library(dplyr)
+library(tidyr)
+library(rsample)
+library(yardstick)
+library(dplyr)
+library(broom)
+library(caret)
+library(e1071)  # SVM
+library(randomForest)  # Random Forest
+options(warn = -1)
+```
+#### Using RNA dataset for supervised learning, cross-validation and model selection approaches.
+
+## Problem 1
+
+
+```{r}
+# load counts table from GEO
+urld <- "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts"
+path <- paste(urld, "acc=GSE109825", "file=GSE109825_raw_counts_GRCh38.p13_NCBI.tsv.gz", sep="&");
+tbl <- as.matrix(data.table::fread(path, header=T, colClasses="integer"), rownames="GeneID")
+
+# load gene annotations 
+apath <- paste(urld, "type=rnaseq_counts", "file=Human.GRCh38.p13.annot.tsv.gz", sep="&")
+annot <- data.table::fread(apath, header=T, quote="", stringsAsFactors=F, data.table=F)
+rownames(annot) <- annot$GeneID
+
+# sample selection
+gsms <- paste0("01011010000000010011000110000010111010111101111000",
+        "01010010011011110101110100001110011010111100111010")
+sml <- strsplit(gsms, split="")[[1]]
+
+# group membership for samples
+gs <- factor(sml)
+groups <- make.names(c("Control","Disease"))
+levels(gs) <- groups
+sample_info <- data.frame(Group = gs, row.names = colnames(tbl))
+
+ds <- DESeqDataSetFromMatrix(countData=tbl, colData=sample_info, design= ~Group)
+
+# Normalized data by "sfType="poscount"
+ds <- DESeq(ds, test="Wald", sfType="poscount")
+
+# Extract the normalized counts
+normalized_counts <- counts(ds, normalized=TRUE)
+
+normalized_counts_df <- as.data.frame(normalized_counts) 
+
+# Convert the normalized counts to log10
+log_normalized_counts <- log10(normalized_counts + 1) # Add 1 to avoid taking the logarithm of 0.
+
+# Convert the log-normalized counts to a data frame for easier viewing
+log_normalized_counts_df <- as.data.frame(log_normalized_counts)
+
+# Display the first few rows of the normalized counts data
+# head(normalized_counts_df)
+
+# Plot the boxplot of log-normalized counts with customized y-axis limits
+boxplot(log_normalized_counts, 
+        main="Boxplot of Log10 Normalized Counts", 
+        las=2, 
+        ylim=c(0, 8))
+
+
+# Remove rows with zero and NA values
+cleaned <- log_normalized_counts_df[rowSums(log_normalized_counts_df != 0, na.rm = TRUE) > 0, ]
+cleaned <- cleaned[complete.cases(cleaned), ]
+
+# Ensure there are no zero rows
+cleaned <- cleaned[rowSums(cleaned == 0) == 0, ]
+
+# Transpose the data
+cleaned_data <- t(cleaned)
+
+
+
+# Calculate standard deviation and select the 1000 rows with the highest variability
+N <- 1000
+column_sd <- apply(cleaned_data, 2, sd) # Using log_normalized_counts_df
+sorted_indices <- order(column_sd, decreasing = TRUE)
+x <- cleaned_data[, sorted_indices[1:N]]
+
+# Add y column
+sample_info$y <- ifelse(sample_info$Group == "Control", 0, 1)
+
+# Set y as grouping information
+y <- sample_info$y # Here y is the grouping information
+
+# Combine into data frame, setting y as a factor using 0 and 1 as labels
+data = cbind(y, x) %>% as.data.frame() %>%
+       mutate(y = factor(y, levels = c("0", "1")))
+
+# Split the dataset
+set.seed(1234) # Set the random seed
+data_split <- initial_split(data, strata = "y")
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+# Create a recipe: define data processing steps for the model, including updating roles, removing zero variance columns, and data normalization.
+recipe <- recipe(data_train) %>%
+    update_role(colnames(x), new_role="predictor")  %>%
+    update_role(y, new_role="outcome") %>%
+    step_zv(all_numeric(), -all_outcomes()) %>%
+    step_normalize(all_numeric(), -all_outcomes())
+
+# Define SVM model using radial basis function kernel (cost is the hyperparameter)
+# Set the engine
+# Set the mode to classification, regression, or censored regression
+svm_spec <- svm_rbf(cost = 0.5) %>%
+    set_engine("kernlab") %>%
+    set_mode("classification")
+
+# Create the workflow from the recipe and the model
+svm_workflow <- workflow() %>%
+    add_recipe(recipe) %>%
+    add_model(svm_spec)
+
+
+# Set the random seed
+set.seed(31416)
+#system start time
+a<-Sys.time()
+#fit the training data to the workflow
+svm_fit <- fit(svm_workflow, data = data_train)
+#system end time
+b<-Sys.time()
+#evaluate time
+b-a
+
+#make class predictions
+class_preds <- predict(svm_fit, new_data = data_test,
+                            type = 'class')
+#make probability predictions
+prob_preds <- predict(svm_fit, new_data = data_test,
+                     type = 'prob')
+
+#combine test y and results into a dataframe
+svm_results<- data_test %>%
+  select(y) %>%
+  bind_cols(class_preds, prob_preds)
+
+#calculate the AUC
+auc<-roc_auc(svm_results,
+        truth = y,
+        ".pred_0", #ground truth
+        event_level="first")$.estimate
+
+#confustion matrix
+conf_mat(svm_results, truth = y, estimate = ".pred_class")
+```
+
+#### The confusion matrix shows the predictive performance of the model.
+#### TP: Actual label is 0, predicted as 0: 6 times
+#### FP: Actual label is 0, predicted as 1: 3 times
+#### FN: Actual label is 1, predicted as 0: 7 times
+#### TP: Actual label is 1, predicted as 1: 10 times <br><br>
+
+```{r}
+#get classification metrics 
+classification_metrics <- metric_set(accuracy, f_meas, spec, sens, npv, ppv)
+classification_metrics(svm_results, truth = y, estimate = ".pred_class")
+```
+
+#### accuracy: 0.615 indicates that about 61.5% of the predictions are correct.
+#### f_meas (F1 score): 0.545 indicates that the model's performance in balancing these two metrics is not very good. This means that when predicting positive samples, the model may have a higher error prediction rate, regardless of how many of the predicted positive samples are actually positive (precision) or how many of the actual positive samples are correctly predicted as positive (recall).
+#### spec: The proportion of negative samples correctly predicted by the model. 0.769 indicates that about 76.9% of negative samples are correctly identified.
+#### sens: The proportion of positive samples correctly predicted by the model. 0.462 indicates that about 46.2% of positive samples are correctly identified.
+#### npv: 0.588 indicates that about 58.8% of the samples predicted as negative are actually negative.
+#### ppv: 0.667 indicates that about 66.7% of the samples predicted as positive are actually positive.<br><br>
+
+```{r}
+#generate an ROC curve
+g_roc<- svm_results %>%
+  roc_curve(truth=y, paste0(".pred_0"), event_level="first") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path(color="red") +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  annotate(geom="text", x=0.75, y=0.1, label=paste0("AUC ", round(auc, 3)), color="red") +
+  ggtitle(paste0("svm ROC"))
+
+# Plot ROC curve
+plot(g_roc)
+```
+
+#### AUC = 0.734 indicates that there is room for improvement in the model, especially in enhancing sensitivity and reducing the false positive rate.<br><br>
+
+```{r}
+#no vip improtance
+
+# Use tidymodels to explain the SVM model
+explainer <- 
+  explain_tidymodels(
+    svm_fit,              # The trained SVM model
+    data = data_train,    # The dataset used for training the model
+    y = data_train$y,     # The y variable
+    verbose = FALSE       # Suppress detailed output
+  )
+
+# Record the start time
+a <- Sys.time()
+# Predict parts for new observations
+breakdown <- predict_parts(explainer = explainer, new_observation = data_test)
+# Record the end time
+b <- Sys.time()
+# Calculate the time taken for prediction
+b - a
+# Plot the prediction explanations
+plot(breakdown)
+```
+
+#### The intercept value of 0.5 indicates that when the influence of all features is 0, the model's baseline prediction is 50%. This means that in the absence of any other influencing factors, the model predicts a 50% probability of the event occurring.
+#### A prediction value of 0.503 indicates that after considering the contributions of all features, the model's final prediction result is 50.3%. This means that the model believes the probability of the event occurring has slightly increased to 50.3%.
+#### The change from 0.5 to 0.503 indicates that the influence of the features has caused a slight increase in the model's prediction. Although this change is small (only an increase of 0.003), it shows their positive impact on the model's predictions.<br><br>
+
+```{r}
+# Calculate feature contributions and save them to a data frame.
+g_importance_data <- breakdown %>%
+  group_by(variable) %>%
+  mutate(mean_val = mean(contribution)) %>%
+  ungroup() %>%
+  arrange(desc(abs(mean_val))) %>%
+  slice_head(n=22) %>%
+  mutate(variable = fct_reorder(variable, abs(mean_val)))
+
+# Calculate variable importance
+g_importance <-
+  breakdown %>%
+  group_by(variable) %>%  # Group by variable
+  mutate(mean_val = mean(contribution, na.rm = TRUE)) %>%  # Calculate the mean contribution for each variable
+  ungroup() %>%  # Ungroup the data
+  arrange(desc(abs(mean_val))) %>%  # Arrange by the absolute value of mean contribution in descending order
+  slice_head(n = 22) %>%  # Select the top 20 variables with the highest contribution
+  mutate(variable = fct_reorder(variable, abs(mean_val))) %>%  # Reorder variables based on absolute mean contribution
+  ggplot(aes(contribution, variable, fill = mean_val > 0)) +  # Set up the plot
+  geom_col(data = ~distinct(., variable, mean_val),  # Add bar plot
+           aes(mean_val, variable), 
+           alpha = 0.5) +  # Set transparency for bar plot
+  geom_boxplot(width = 0.5) +  # Add box plot
+  theme_bw() +  # Use a white background theme
+  theme(legend.position = "none") +  # Hide the legend
+  scale_fill_viridis_d() +  # Set color palette
+  labs(y = NULL)  # Remove y-axis label
+
+# Plot g_importance)
+print(g_importance)
+```
+
+```{r}
+# Select the top 20 features
+top20_features <- g_importance_data$variable[1:22]
+
+# Extract feature names (remove values after the equal sign)
+top20_features <- sub(" =.*", "", top20_features)
+
+# Expect for "prediction" and "intercept"
+top20_features <- top20_features[!(top20_features %in% c("prediction", "intercept"))]
+
+top20_features
+
+# Select the features's data, where y is the first column
+df<- data_train[, c("y", top20_features), drop = FALSE]
+
+
+# Fit a few logistic regression models with different numbers of variables
+M1=glm(y ~ . , data=df[,1,drop=F], family="binomial",na.action="na.exclude")
+M3=glm(y ~ . , data=df[,1:3], family="binomial",na.action="na.exclude")
+M5=glm(y ~ . , data=df[,1:5], family="binomial",na.action="na.exclude")
+M7=glm(y ~ . , data=df[,1:7], family="binomial",na.action="na.exclude")
+M10=glm(y ~ . , data=df[,1:10], family="binomial",na.action="na.exclude")
+M12=glm(y ~ . , data=df[,1:12], family="binomial",na.action="na.exclude")
+M15=glm(y ~ . , data=df[,1:15], family="binomial",na.action="na.exclude")
+M18=glm(y ~ . , data=df[,1:18], family="binomial",na.action="na.exclude")
+M20=glm(y ~ . , data=df[,1:20], family="binomial",na.action="na.exclude")
+
+
+# AIC and BIC functions (below) can take any number of models as their
+# arguments and compute the information criterion values for each of them:
+AIC(M1,M3,M5,M7,M10,M12,M15,M18,M20)
+
+BIC(M1,M3,M5,M7,M10,M12,M15,M18,M20)
+```
+
+#### From the results of AIC and BIC, it can be seen that the number of variables should be limited to the range of 1-3. 
+
+```{r}
+#################
+#cross-validation 
+##################
+# Ensure the selected features exist in the training data
+selected_features <- c("y", top20_features)
+
+# Use the previously selected features
+data_train_selected <- data_train %>% select(all_of(selected_features))
+
+set.seed(1234)
+
+# Create cross-validation folds
+folds <- vfold_cv(data_train_selected, v = 10)
+
+# Define the logistic regression model specification
+logistic_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+# Define the workflow and function for accuracy evaluation
+evaluate_model <- function(formula, data, folds) {
+  recipe <- recipe(formula, data = data_train_selected)
+  control <- control_resamples(save_pred = TRUE)
+  
+  # Fit the model
+  logistic_res <- fit_resamples(logistic_spec, recipe, folds, control = control, metrics = classification_metrics)
+  
+  # Collect results
+  cv_results <- collect_metrics(logistic_res)
+  return(cv_results)
+}
+
+# Store the accuracy results for each model
+results <- data.frame(Model = character(), Accuracy = numeric())
+
+# Define the model formula and evaluate accuracy
+for (i in c(1, 3, 5, 7, 10, 12, 15, 18, 20)) {
+  formula <- as.formula(paste("y ~ ."))
+  cv_results <- evaluate_model(formula, data_train_selected[, 1:i, drop = FALSE], folds)
+  
+  # Extract accuracy and add to the results data frame
+  accuracy <- cv_results %>%
+    filter(.metric == "accuracy") %>%
+    pull(mean)
+  
+  results <- rbind(results, data.frame(Model = paste0("M", i), Accuracy = accuracy))
+}
+
+# Output the accuracy of all models
+print(results)
+
+```
+
+#### In terms of accuracy, each model successfully predicted accurately. This may be because the outcome only has values of 0 and 1.<br><br>
+
+#### Based on AIC, BIC, and accuracy, M3 is the best model. Compared to the basic model, the accuracy increased from 0.615 to 1, a rise of 62.6%. However, I think there is a possibility of overfitting, even though there are only two outcomes: 0 and 1.<br><br> 
+
+
+# Problem 2
+
+
+```{r}
+#################
+#cross-validation 
+##################
+library(yardstick)
+
+# Select the top 20 features
+ranked_features <- g_importance_data$variable[1:22]
+
+# Extract feature names (remove values after the equal sign)
+ranked_feature_names <- sub(" =.*", "", ranked_features)
+
+# Expect for "prediction" and "intercept"
+ranked_feature_names <- top20_features[!(top20_features %in% c("prediction", "intercept"))]
+
+ranked_feature_names
+```
+
+```{r}
+# Ensure the selected features exist in the training data
+data_train_selected <- data_train %>% select(all_of(ranked_feature_names), y)
+```
+
+
+```{r}
+# Create a recipe: define data processing steps for the model
+recipe <- recipe(y ~ ., data = data_train_selected) %>%
+    update_role(y, new_role = "outcome") %>%
+    update_role(all_of(ranked_feature_names), new_role = "predictor") %>%
+    step_zv(all_numeric(), -all_outcomes()) %>%
+    step_normalize(all_numeric(), -all_outcomes())
+
+# Define SVM model using radial basis function kernel (cost is the hyperparameter)
+svm_spec <- svm_rbf(cost = 0.5) %>%
+    set_engine("kernlab") %>%
+    set_mode("classification")
+
+# Create the workflow from the recipe and the model
+svm_workflow <- workflow() %>%
+    add_recipe(recipe) %>%
+    add_model(svm_spec)
+
+#fit the training data to the workflow
+svm_fit <- fit(svm_workflow, data = data_train_selected)
+```
+
+
+```{r}
+# Set random seed
+set.seed(1234)
+
+# Initialize results storage
+results <- data.frame(K = integer(), 
+                      accuracy = numeric(), 
+                      sensitivity = numeric(), 
+                      specificity = numeric())
+
+# Set the range for K
+K_range <- 1:20  # Set K range from 1 to 3
+
+# Parallelize to 12 cores
+doParallel::registerDoParallel(12)
+
+# For loop for feature selection and model evaluation
+for (K in K_range) {
+  # Take the top K features
+  select_features <- ranked_feature_names[1:K]  # Take the top K features
+  
+  # Ensure the selected features exist in the training data
+  data_train_selected <- data_train %>% select(all_of(select_features), y)
+  
+  # Create a new recipe for the current selection of features
+  recipe <- recipe(y ~ ., data = data_train_selected) %>%
+      update_role(y, new_role = "outcome") %>%
+      update_role(all_of(select_features), new_role = "predictor") %>%
+      step_zv(all_numeric(), -all_outcomes()) %>%
+      step_normalize(all_numeric(), -all_outcomes())
+  
+  # Cross-validation setup
+  folds <- vfold_cv(data_train_selected, v = 10, repeats = 100)  # Use 10 folds
+  
+  # Control parameters
+  control <- control_resamples(save_pred = TRUE)
+  
+  # Define SVM model using radial basis function kernel (cost is the hyperparameter)
+  svm_spec <- svm_rbf(cost = 0.5) %>%
+      set_engine("kernlab") %>%
+      set_mode("classification")
+  
+  # Create the workflow from the recipe and the model
+  svm_workflow <- workflow() %>%
+      add_recipe(recipe) %>%
+      add_model(svm_spec)
+  
+  # Perform cross-validation using the fitted model
+  svm_res <- fit_resamples(
+    svm_workflow,  
+    resamples = folds,
+    control = control,
+    metrics = classification_metrics
+  )
+  
+  # Collect metrics
+  metrics_summary <- collect_metrics(svm_res)
+  
+  # Extract required metrics
+  accuracy <- metrics_summary %>% filter(.metric == "accuracy") %>% summarize(mean = mean(mean)) %>% pull(mean)
+  sensitivity <- metrics_summary %>% filter(.metric == "sens") %>% summarize(mean = mean(mean)) %>% pull(mean)
+  specificity <- metrics_summary %>% filter(.metric == "spec") %>% summarize(mean = mean(mean)) %>% pull(mean)
+  
+  # Store results
+  results <- rbind(results, data.frame(K = K, accuracy = accuracy, sensitivity = sensitivity, specificity = specificity))
+}
+
+# Plot the results, separating different metrics
+results_long <- pivot_longer(results, cols = -K, names_to = "metric", values_to = "mean")
+
+```
+
+```{r}
+# Plot the results_long
+ggplot(results_long, aes(x = K, y = mean, color = metric)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(title = "Cross-Validation Results for Different K Values",
+       x = "Number of Features K",
+       y = "Mean Value") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  facet_wrap(~ metric, scales = "free_y") +
+  ylim(0.8, 1)  # Y-axis range
+```
+
+#### Based on the chart, the accuracy, sensitivity, and specificity are all highest at K=0-5, so it should be selected as the optimal model.<br><br>
+
+
+# Problem 3
+
+
+```{r}
+###############
+#Tuning a model
+################
+
+#in svm , the cost is tunable, rbf_gisma
+#either set bootstraps or cross-validation
+
+# Set the random seed
+set.seed(1234)
+
+# Use vfold_cv function for cross-validation
+folds <- vfold_cv(data_train, strata = y)
+
+# Adjust hyperparameters
+svm_grid <- expand.grid(cost = c(-10, 5), rbf_sigma = c(0.001,0.005,0.01,0.05,0.1,0.5,1))
+
+#in the model spec, change cost to tune()
+tune_spec <- svm_rbf(cost = tune(), rbf_sigma=tune()) %>%
+    set_engine("kernlab") %>% # Use kernlab package for SVM
+    set_mode("classification") # Set the model to classification mode
+
+#update the workflow spec with the new model
+tune_workflow <- workflow() %>%
+    add_recipe(recipe) %>% # Add the data processing steps to the workflow
+    add_model(tune_spec) # Add the adjusted model specification to the workflow
+
+#parallelize to 2 cores (or more, depending on machine)
+doParallel::registerDoParallel(2)
+
+# Set the random seed
+set.seed(1234)
+#system start time
+a<-Sys.time()
+#run the tuning grid
+svm_grid <- tune_grid(
+  tune_workflow,
+  resamples = folds,  
+  grid=svm_grid
+)
+#system end time
+b<-Sys.time()
+b-a
+```
+```{r}
+#evaluate the tune: does changing the hyperparameters alter performance?
+svm_grid %>%
+  collect_metrics() %>% # Collect the performance metrics of the tuning results
+  ggplot(aes(cost, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+```
+
+#### Changing the model’s cost (hyperparameter) did not significantly impact the model’s performance metrics. The model’s performance remained very stable across different cost levels. It’s possible that the features and outcomes of this dataset are clearly distinguishable.<br><br>
+
+```{r}
+#get the tuning metrics
+svm_metrics<-svm_grid %>%
+  collect_metrics()
+
+# Show the svm_metrics
+svm_metrics
+```
+
+```{r}
+#pick the best cost on highest roc_auc or accuracy
+highest_roc_auc <- svm_grid %>%
+  select_best(metric="roc_auc")  
+
+# Show the highest_roc_auc
+highest_roc_auc
+```
+
+#### The optimal parameter values of the best model are “cost = 5” and “rbf_sigma = 0.001”.<br><br>
+
+
+```{r}
+#finalize the model
+final_svm <- finalize_model(
+        tune_spec,
+        highest_roc_auc
+        )
+
+#finalize the workflow
+final_wf <- workflow() %>%
+        add_recipe(recipe) %>%
+        add_model(final_svm)
+
+#fit the final tuned model
+svm_tune_fit <- fit(final_wf, data = data_train)
+
+#predict class, probability
+class_preds_tune <- predict(svm_tune_fit, new_data = data_test,
+                            type = 'class')
+prob_preds_tune <- predict(svm_tune_fit, new_data = data_test,
+                     type = 'prob')
+
+#collate results
+svm_tune_results<- data_test %>%
+  select(y) %>%
+  bind_cols(class_preds_tune, prob_preds_tune)
+
+#calculate AUC
+auc_tune<-roc_auc(svm_tune_results,
+        truth = y,
+        ".pred_0", 
+        event_level="first")$.estimate
+
+#confusion matrix and metrics
+conf_mat(svm_tune_results, truth = y, estimate = ".pred_class")
+```
+```{r}
+#tune ROC curve
+g_roc_tune<- svm_tune_results %>%
+  roc_curve(truth=y, paste0(".pred_0"), event_level="first") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path(color="red") +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  theme_bw() +
+  annotate(geom="text", x=0.75, y=0.1, label=paste0("AUC ", round(auc_tune, 3)), color="red") +
+  ggtitle(paste0("Tuned svm ROC"))
+
+# Plot ROC curve
+plot(g_roc_tune)
+```
+
+#### AUC = 1 indicates that the model’s overall performance on the classification task is very good. The closer the AUC value is to 1, the stronger the model’s classification capability.<br><br>
+
+
+```{r}
+#vip importance unavailable
+
+# Create an explainer to understand the predictions of the svm_tune_fit model
+explainer_tune <- 
+  explain_tidymodels(
+    svm_tune_fit, 
+    data = data_train, 
+    y = data_train$y,
+    verbose = FALSE
+  )
+
+
+# Record the start time
+a <- Sys.time()
+
+# Generate a breakdown of the model's predictions for the data_test dataset
+# The breakdown is stored in the breakdown_tune object
+breakdown_tune <- predict_parts(explainer = explainer_tune, new_observation = data_test)
+
+# Record the end time
+b <- Sys.time()
+
+# Calculate the execution time of the predict_parts() function
+b - a
+```
+```{r}
+# Plot the breakdown of the model's predictions
+plot(breakdown_tune)
+```
+
+#### The Break Down profile shows the contribution of each feature to the model’s prediction. The intercept and prediction features have the greatest contribution to the model’s prediction. Other features, such as 9575, represented by red bars, indicate that the feature has a negative impact on the model’s prediction results. The green bar for 401562 represents that the feature has a positive impact on the model’s prediction results.<br><br>
+
+
+```{r}
+# Calculate feature contributions and save them to a data frame.
+g_importance_data <- breakdown_tune %>%
+  group_by(variable) %>%
+  mutate(mean_val = mean(contribution)) %>%
+  ungroup() %>%
+  arrange(desc(abs(mean_val))) %>%
+  slice_head(n=20) %>%
+  mutate(variable = fct_reorder(variable, abs(mean_val)))
+
+# Plot g_importance_tune
+g_importance_tune<-
+  breakdown_tune %>%
+  group_by(variable) %>%
+  mutate(mean_val = mean(contribution)) %>%
+  ungroup() %>%
+  arrange(desc(abs(mean_val))) %>% slice_head(n=20) %>%
+  mutate(variable = fct_reorder(variable, abs(mean_val))) %>%
+  ggplot(aes(contribution, variable, fill = mean_val > 0)) +
+  geom_col(data = ~distinct(., variable, mean_val), 
+           aes(mean_val, variable), 
+           alpha = 0.5) +
+  geom_boxplot(width = 0.5) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_viridis_d() +
+  labs(y = NULL)
+
+# Plot the g_importance_tune
+plot(g_importance_tune)
+```
+
+```{r}
+# Extract the top 10 important features expect for prediction and intercept
+ranked_features <- g_importance_data$variable[1:12]
+
+# Expect for "prediction" and "intercept"
+ranked_features <- ranked_features[!(ranked_features %in% c("prediction", "intercept"))]
+
+ranked_feature_names <- sub(" =.*", "", ranked_features)
+```
+
+
+```{r}
+# Set the random seed for reproducibility
+set.seed(1234)
+
+# Select K=10 features
+selected_top10features <- ranked_feature_names[1:10]
+
+# Ensure the selected features exist in the training data
+data_train_features <- data_train %>% select(all_of(selected_top10features), y)
+
+
+# Define the recipe using the selected features
+recipe <- recipe(y ~ ., data = data_train_selected)
+
+# Set up cross-validation
+folds <- vfold_cv(data_train_selected, v = 10)
+
+# Define the range of gamma values
+gamma_grid <- tibble(rbf_sigma = c(0.001,0.005,0.01,0.05,0.1,0.5,1))
+
+# Define the model specification
+tune_spec <- svm_rbf(cost = 1, rbf_sigma = tune()) %>%
+    set_engine("kernlab") %>%
+    set_mode("classification")
+
+# Create the workflow for tuning
+svm_workflow <- workflow() %>%
+    add_recipe(recipe) %>%
+    add_model(tune_spec)
+
+# Perform hyperparameter tuning with cross-validation
+svm_tune_results <- tune_grid(
+    svm_workflow,
+    resamples = folds,
+    grid = gamma_grid,
+    control = control_grid(save_pred = TRUE)
+)
+
+# Collect metrics summary
+metrics_summary <- collect_metrics(svm_tune_results)
+
+# Modify the .metric column in metrics_summary
+metrics_summary <- metrics_summary %>%
+  mutate(.metric = case_when(
+    .metric == "brier_class" ~ "sens",
+    .metric == "roc_auc" ~ "spec",
+    TRUE ~ .metric  # Keep other values unchanged.
+  ))
+```
+
+
+```{r}
+# Filter metrics for plotting
+metrics_long <- metrics_summary %>%
+  filter(.metric %in% c("accuracy", "sens", "spec")) %>%
+  mutate(gamma = rbf_sigma)
+####### metrics=metric_set(accuracy, sens, spec)
+# Plot model performance metrics as gamma increases
+ggplot(metrics_long, aes(x = log10(gamma), y = mean, color = .metric)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(title = "Model Performance Metrics as Gamma Increases",
+       x = "Log10(Gamma)", 
+       y = "Mean Value") +
+  theme_minimal() +
+  scale_color_manual(values = c("red", "blue", "green"),
+                     labels = c("accuracy", "sensitivity", "specificity")) +
+  facet_wrap(~ .metric, scales = "free_y")
+
+
+```
+
+#### When gamma = 0.1 (log10 value = -1), the accuracy and specificity reach the highest (0.95 and 1.00 respectively), while the sensitivity, though not the highest, is still at a relatively high level. Therefore, Gamma = 0.1 would be a relatively good choice.<br><br>
+
+
+# Problem 4
+
+
+```{r}
+# Logistic regression analysis
+logistic_model <- glm(y ~ ., data = data_train, family = binomial)
+
+# Get model summary
+logistic_summary <- summary(logistic_model)
+
+# logistic_summary
+
+# Extract p-values
+p_values <- logistic_summary$coefficients[, 4]
+
+# Convert p-values to a data frame and sort by p-value
+results <- data.frame(Gene = names(p_values), P_Value = p_values)
+results <- results[order(results$P_Value), ]
+
+# Get top 10 and top 20 significant genes
+top10_genes <- results[1:11, ]
+top20_genes <- results[1:21, ]
+
+# Display top 10 and top 20 significant genes
+top10_genes
+top20_genes
+```
+
+
+```{r}
+# Remove backticks from gene names
+top10_genes$Gene <- gsub("`", "", top10_genes$Gene)
+top20_genes$Gene <- gsub("`", "", top20_genes$Gene)
+
+# 移除 top10_genes 中的 "(Intercept)" 行
+top10_genes <- top10_genes[top10_genes$Gene != "(Intercept)", ]
+
+# 移除 top20_genes 中的 "(Intercept)" 行
+top20_genes <- top20_genes[top20_genes$Gene != "(Intercept)", ]
+
+# Ensure gene names are present in the data frame
+print(top10_genes$Gene)
+print(top20_genes$Gene)
+
+```
+
+
+```{r}
+# Load necessary libraries
+# library(caret)
+# library(e1071)  # SVM
+# library(randomForest)  # Random Forest
+
+# Function to calculate accuracy
+calculate_accuracy <- function(model, data_test) {
+  predictions <- predict(model, newdata = data_test)
+  
+  # Convert predictions to factors and ensure levels are consistent
+  predictions <- factor(predictions, levels = levels(data_test$y))
+  
+  # Ensure actual labels are also factors
+  actuals <- factor(data_test$y, levels = levels(data_test$y))
+  
+  confusion_matrix <- confusionMatrix(predictions, actuals)
+  return(confusion_matrix$overall['Accuracy'])
+}
+
+# 1. Logistic regression model (Top 10)
+logistic_model_top10 <- glm(y ~ ., data = data_train[, c("y", as.character(top10_genes$Gene))], family = binomial)
+accuracy_logistic_top10 <- calculate_accuracy(logistic_model_top10, data_test)
+
+# 2. Logistic regression model (Top 20)
+logistic_model_top20 <- glm(y ~ ., data = data_train[, c("y", as.character(top20_genes$Gene))], family = binomial)
+accuracy_logistic_top20 <- calculate_accuracy(logistic_model_top20, data_test)
+
+# Output accuracy
+print(paste("Accuracy for LR model with Top 10 genes:", accuracy_logistic_top10))
+print(paste("Accuracy for LR model with Top 20 genes:", accuracy_logistic_top20))
+
+```
+
+
+```{r}
+# 3. SVM model (Top 10) with RBF kernel
+svm_model_top10_rbf <- svm(y ~ ., 
+                            data = data_train[, c("y", as.character(top10_genes$Gene))], 
+                            kernel = "radial", 
+                            cost = 1, 
+                            gamma = 0.05)
+accuracy_svm_top10_rbf <- calculate_accuracy(svm_model_top10_rbf, data_test)
+
+# 4. SVM model (Top 20) with RBF kernel
+svm_model_top20_rbf <- svm(y ~ ., 
+                            data = data_train[, c("y", as.character(top20_genes$Gene))], 
+                            kernel = "radial", 
+                            cost = 1, 
+                            gamma = 0.05)
+accuracy_svm_top20_rbf <- calculate_accuracy(svm_model_top20_rbf, data_test)
+
+# Output accuracy
+print(paste("Accuracy for SVM model with Top 10 genes (RBF):", accuracy_svm_top10_rbf))
+print(paste("Accuracy for SVM model with Top 20 genes (RBF):", accuracy_svm_top20_rbf))
+
+```
+
+
+```{r}
+# library(tidymodels)
+# library(randomForest)
+
+# Set random seed for reproducibility
+set.seed(31416)
+
+# Function to calculate accuracy
+calculate_accuracy <- function(model, data_test) {
+  predictions <- predict(model, new_data = data_test)  # Specify new_data parameter
+  
+  # Convert predictions to factors and ensure levels are consistent
+  predictions <- factor(predictions$.pred_class, levels = levels(data_test$y))
+  
+  # Ensure actual labels are also factors
+  actuals <- factor(data_test$y, levels = levels(data_test$y))
+  
+  confusion_matrix <- confusionMatrix(predictions, actuals)
+  return(confusion_matrix$overall['Accuracy'])
+}
+
+# 5. Random Forest model (Top 10)
+top10_genes <- as.character(top10_genes$Gene)  # Convert top 10 genes to character vector
+
+# Create a recipe for the model
+recipe_top10 <- recipe(data_train) %>%
+    update_role(all_of(top10_genes), new_role = "predictor") %>%  
+    update_role(y, new_role = "outcome") %>%  # Set response variable y as outcome
+    step_zv(all_numeric(), -all_outcomes()) %>%  # Remove zero variance predictors
+    step_normalize(all_numeric(), -all_outcomes())  # Normalize numeric predictors
+
+# Specify the Random Forest model with parameters
+rf_spec_top10 <- rand_forest(trees = 1e3, mtry = sqrt(length(top10_genes)), min_n = 5) %>%
+           set_engine("randomForest", importance = TRUE) %>%  
+           set_mode("classification")  
+
+# Create a workflow combining the recipe and model specification
+rf_workflow_top10 <- workflow() %>%
+    add_recipe(recipe_top10) %>%  
+    add_model(rf_spec_top10)  
+
+
+# Train model
+rf_fit_top10 <- fit(rf_workflow_top10, data = data_train)
+
+# Calculate accuracy
+accuracy_rf_top10 <- calculate_accuracy(rf_fit_top10, data_test)
+
+# 6. Random Forest model (Top 20)
+top20_genes <- as.character(top20_genes$Gene)  
+
+# Create a recipe for the model
+recipe_top20 <- recipe(data_train) %>%
+    update_role(all_of(top20_genes), new_role = "predictor") %>%  #
+    update_role(y, new_role = "outcome") %>%  
+    step_zv(all_numeric(), -all_outcomes()) %>%  
+    step_normalize(all_numeric(), -all_outcomes())  
+
+# Specify the Random Forest model with parameters
+rf_spec_top20 <- rand_forest(trees = 1e3, mtry = sqrt(length(top20_genes)), min_n = 5) %>%
+           set_engine("randomForest", importance = TRUE) %>%  
+           set_mode("classification")  
+
+# Create a workflow combining the recipe and model specification
+rf_workflow_top20 <- workflow() %>%
+    add_recipe(recipe_top20) %>%  
+    add_model(rf_spec_top20)  
+
+
+# Train model
+rf_fit_top20 <- fit(rf_workflow_top20, data = data_train)
+
+# Calculate accuracy
+accuracy_rf_top20 <- calculate_accuracy(rf_fit_top20, data_test)
+
+# Output accuracy
+print(paste("Accuracy for RF model with Top 10 genes:", accuracy_rf_top10))
+print(paste("Accuracy for RF model with Top 20 genes:", accuracy_rf_top20))
+
+
+```
+
+#### Based on the accuracy results, both of RF and SVM models achieved an accuracy of 1 for both the top 10 and top 20 genes, indicating relatively high predictive ability. In contrast, the LR model had an accuracy of NaN, which suggests that the model encountered issues during the fitting process, likely due to complete separation in the data.<br><br>
+
+
+```{r}
+# record end time
+end_time <- Sys.time()
+
+# execution time
+execution_time <- end_time - start_time
+execution_time
+
+```
+
+
