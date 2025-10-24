@@ -1,10 +1,12 @@
-#########################################################################################
-# 
-# Author: Ya-Ting Yang
+##################################
+#
+# title: "Design an informatics workflow to analyze and report on the expressed genes in Python"
+# author: Ya-Ting Yang
 # 
 # The workflow.py script does analysis of fastq file, aligns it with reference genome file to create a sam file, converts the sam to a bam file   
 # 
-#
+##################################
+
 from Bio import SeqIO
 import sys, subprocess, os
 
